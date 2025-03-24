@@ -1,0 +1,12 @@
+jax[cuda12]
+pydantic
+omegaconf
+flax
+optax
+black
+isort
+mypy
+flake8
+wandb
+tqdm
+distrax
