@@ -6,7 +6,7 @@ wandb/
 D4RL
 fig
 tmp
-
+checkpoints
 
 # C extensions
 *.so

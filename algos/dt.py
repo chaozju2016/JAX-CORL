@@ -13,6 +13,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import wandb
+import flax
 from flax import linen as nn
 from flax.training.train_state import TrainState
 from omegaconf import OmegaConf
@@ -57,9 +58,9 @@ config: DTConfig = DTConfig(**conf_dict)
 # RTG target is specific to each environment
 if "HalfCheetah" in config.env_name:
     rtg_target = 12000
-elif "hopper" in config.env_name:
+elif "Hopper" in config.env_name:
     rtg_target = 3600
-elif "walker" in config.env_name:
+elif "Walker" in config.env_name:
     rtg_target = 5000
 else:
     raise ValueError("We only care about Mujoco envs for now.")
@@ -78,7 +79,9 @@ class MaskedCausalAttention(nn.Module):
     kernel_init: Callable = default_init()
 
     @nn.compact
-    def __call__(self, x: jnp.ndarray, training=True) -> jnp.ndarray:
+    def __call__(
+        self, x: jnp.ndarray, training=True
+    ) -> Tuple[jnp.ndarray, jnp.ndarray]:
         B, T, C = x.shape
         N, D = self.n_heads, C // self.n_heads
         # rearrange q, k, v as (B, N, T, D)
@@ -115,7 +118,7 @@ class MaskedCausalAttention(nn.Module):
         out = nn.Dropout(self.drop_p, deterministic=not training)(
             nn.Dense(self.h_dim)(attention)
         )
-        return out
+        return out, normalized_weights
 
 
 class Block(nn.Module):
@@ -126,13 +129,14 @@ class Block(nn.Module):
     kernel_init: Callable = default_init()
 
     @nn.compact
-    def __call__(self, x: jnp.ndarray, training=True) -> jnp.ndarray:
+    def __call__(
+        self, x: jnp.ndarray, training=True
+    ) -> Tuple[jnp.ndarray, jnp.ndarray]:
         # Attention -> LayerNorm -> MLP -> LayerNorm
-        x = x + MaskedCausalAttention(
+        attn, normalized_weights = MaskedCausalAttention(
             self.h_dim, self.max_T, self.n_heads, self.drop_p
-        )(
-            x, training=training
-        )  # residual
+        )(x, training=training)
+        x = x + attn  # residual
         x = nn.LayerNorm()(x)
         # MLP
         out = nn.Dense(4 * self.h_dim, kernel_init=self.kernel_init)(x)
@@ -142,7 +146,7 @@ class Block(nn.Module):
         # residual
         x = x + out
         x = nn.LayerNorm()(x)
-        return x
+        return x, normalized_weights
 
 
 class DecisionTransformer(nn.Module):
@@ -181,8 +185,9 @@ class DecisionTransformer(nn.Module):
         actions: jnp.ndarray,
         returns_to_go: jnp.ndarray,
         training=True,
-    ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, Dict[int, jnp.ndarray]]:
         B, T, _ = states.shape
+        attns = {}
 
         time_embeddings = self.embed_timestep(timesteps)
         # time embeddings are treated similar to positional embeddings
@@ -198,8 +203,9 @@ class DecisionTransformer(nn.Module):
         )
         h = self.embed_ln(h)
         # transformer and prediction
-        for block in self.blocks:
-            h = block(h, training=training)
+        for i, block in enumerate(self.blocks):
+            h, attn = block(h, training=training)
+            attns[i] = attn.copy()
         # get h reshaped such that its size = (B x 3 x T x h_dim) and
         # h[:, 0, t] is conditioned on r_0, s_0, a_0 ... r_t
         # h[:, 1, t] is conditioned on r_0, s_0, a_0 ... r_t, s_t
@@ -208,11 +214,11 @@ class DecisionTransformer(nn.Module):
         # get predictions
         return_preds = self.predict_rtg(h[:, 2])  # predict next rtg given r, s, a
         state_preds = self.predict_state(h[:, 2])  # predict next state given r, s, a
-        action_preds = self.predict_action(h[:, 1])
+        action_preds = self.predict_action(h[:, 1])  # predict next action given r, s
         if self.use_action_tanh:
             action_preds = jnp.tanh(action_preds)
 
-        return state_preds, action_preds, return_preds
+        return state_preds, action_preds, return_preds, attns
 
 
 def discount_cumsum(x: jnp.ndarray, gamma: float) -> jnp.ndarray:
@@ -400,8 +406,15 @@ class DT(object):
         )
 
         def loss_fn(params):
-            state_preds, action_preds, return_preds = train_state.transformer.apply_fn(
-                params, timesteps, states, actions, returns_to_go, rngs={"dropout": rng}
+            state_preds, action_preds, return_preds, attns = (
+                train_state.transformer.apply_fn(
+                    params,
+                    timesteps,
+                    states,
+                    actions,
+                    returns_to_go,
+                    rngs={"dropout": rng},
+                )
             )  # B x T x state_dim, B x T x act_dim, B x T x 1
             # mask actions
             actions_masked = actions * traj_mask[:, :, None]
@@ -424,16 +437,18 @@ class DT(object):
         states: jnp.ndarray,
         actions: jnp.ndarray,
         returns_to_go: jnp.ndarray,
-    ) -> jnp.ndarray:
-        state_preds, action_preds, return_preds = train_state.transformer.apply_fn(
-            train_state.transformer.params,
-            timesteps,
-            states,
-            actions,
-            returns_to_go,
-            training=False,
+    ) -> Tuple[jnp.ndarray, Dict[int, jnp.ndarray]]:
+        state_preds, action_preds, return_preds, attns = (
+            train_state.transformer.apply_fn(
+                train_state.transformer.params,
+                timesteps,
+                states,
+                actions,
+                returns_to_go,
+                training=False,
+            )
         )
-        return action_preds
+        return action_preds, attns
 
 
 def create_dt_train_state(
@@ -517,7 +532,7 @@ def evaluate(
             running_rtg = running_rtg - (running_reward / config.rtg_scale)
             rewards_to_go = rewards_to_go.at[0, t].set(running_rtg)
             if t < config.context_len:
-                act_preds = policy_fn(
+                act_preds, attns = policy_fn(
                     train_state,
                     timesteps[:, : t + 1],
                     states[:, : t + 1],
@@ -526,7 +541,7 @@ def evaluate(
                 )
                 act = act_preds[0, -1]
             else:
-                act_preds = policy_fn(
+                act_preds, attns = policy_fn(
                     train_state,
                     timesteps[:, t - config.context_len + 1 : t + 1],
                     states[:, t - config.context_len + 1 : t + 1],
@@ -541,20 +556,23 @@ def evaluate(
             if done or truncated:
                 break
     normalized_score = (
-        normalize_score(score=total_reward / config.num_eval_episodes) * 100
+        normalize_score(
+            score=total_reward / config.num_eval_episodes, env_id=config.env_name
+        )
+        * 100
     )
     # env.get_normalized_score(total_reward / config.num_eval_episodes) * 100
     return normalized_score
 
 
-def normalize_score(score, env_id="HalfCheetah-v4"):
+def normalize_score(score, env_id="HalfCheetah-v5"):
     # MuJoCo环境的参考分数
     reference_scores = {
-        "Ant-v4": {"min": 0.0, "max": 6000.0},
-        "HalfCheetah-v4": {"min": -280.0, "max": 12000.0},
-        "Hopper-v4": {"min": -20.0, "max": 3800.0},
-        "Humanoid-v4": {"min": 0.0, "max": 10000.0},
-        "Walker2d-v4": {"min": 0.0, "max": 5000.0},
+        "Ant-v5": {"min": 0.0, "max": 6000.0},
+        "HalfCheetah-v5": {"min": -280.0, "max": 12000.0},
+        "Hopper-v5": {"min": -20.0, "max": 3800.0},
+        "Humanoid-v5": {"min": 0.0, "max": 10000.0},
+        "Walker2d-v5": {"min": 0.0, "max": 5000.0},
         # 添加其他MuJoCo环境
     }
 
@@ -584,6 +602,16 @@ if __name__ == "__main__":
 
     algo = DT()
     update_fn = jax.jit(algo.update)
+
+    # Create checkpoint directory
+    ckpt_dir = os.path.join(
+        "checkpoints", config.project, config.env_name, f"seed_{config.seed}"
+    )
+    os.makedirs(ckpt_dir, exist_ok=True)
+
+    # Initialize best score tracker
+    best_score = float("-inf")
+
     for i in tqdm(range(1, config.max_steps + 1), smoothing=0.1, dynamic_ncols=True):
         rng, data_rng, update_rng = jax.random.split(rng, 3)
         traj_batch = sample_traj_batch(
@@ -609,9 +637,25 @@ if __name__ == "__main__":
                     "step": i,
                 }
             )
+
+            # Save checkpoint if score is better than or equal to the best score
+            if normalized_score >= best_score:
+                best_score = normalized_score
+                ckpt_path = os.path.join(ckpt_dir, f"step_{i}_score_{best_score:.2f}")
+                with open(ckpt_path, "wb") as f:
+                    f.write(flax.serialization.to_bytes(train_state))
+                print(f"New best model saved with score: {best_score:.2f} at step {i}")
+
     # final evaluation
     normalized_score = evaluate(
         algo.get_action, train_state, env, config, state_mean, state_std
     )
     wandb.log({f"{config.env_name}/final_normalized_score": normalized_score})
+
+    # Save final model
+    final_ckpt_path = os.path.join(ckpt_dir, "final_model")
+    with open(final_ckpt_path, "wb") as f:
+        f.write(flax.serialization.to_bytes(train_state))
+    print(f"Final model saved at: {final_ckpt_path}")
+
     wandb.finish()
