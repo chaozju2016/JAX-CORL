@@ -8,6 +8,10 @@ from typing import Any, Callable, Dict, NamedTuple, Optional, Sequence, Tuple
 import minari
 import brax
 import gymnasium as gym
+import gymnasium_robotics
+
+gym.register_envs(gymnasium_robotics)
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -21,16 +25,17 @@ from pydantic import BaseModel
 from tqdm import tqdm
 
 os.environ["XLA_FLAGS"] = "--xla_gpu_triton_gemm_any=True"
-os.environ["WANDB_MODE"] = "offline"
+# os.environ["WANDB_MODE"] = "offline"
 
 
 class DTConfig(BaseModel):
     # GENERAL
     algo: str = "DT"
-    project: str = "decision-transformer"
+    project: str = "align-decision-transformer"
     seed: int = 0
     env_name: str = "HalfCheetah-v5"
     dataset_name: str = "mujoco/halfcheetah/expert-v0"
+    experiment_name: str = "CLIP"
     batch_size: int = 64
     num_eval_episodes: int = 5
     max_eval_ep_len: int = 1000
@@ -50,6 +55,9 @@ class DTConfig(BaseModel):
     # DT SPECIFIC
     rtg_scale: int = 1000
     rtg_target: int = None
+    # 添加多模态对齐参数
+    alignment_weight: float = 0.1  # 对齐损失权重
+    alignment_temp: float = 0.1  # 对比学习温度参数
 
 
 conf_dict = OmegaConf.from_cli()
@@ -62,8 +70,21 @@ elif "Hopper" in config.env_name:
     rtg_target = 3600
 elif "Walker" in config.env_name:
     rtg_target = 5000
+elif "Humanoid" in config.env_name:
+    rtg_target = 12000
+elif "InvertedDoublePendulum" in config.env_name:
+    rtg_target = 9000
+elif "Pusher" in config.env_name:
+    rtg_target = 0  # Pusher是一个负回报环境，通常目标是最小化惩罚
+elif "Reacher" in config.env_name:
+    rtg_target = -4  # Reacher也是一个负回报环境
+elif "Swimmer" in config.env_name:
+    rtg_target = 300
+elif "AntMaze" in config.env_name:
+    # AntMaze环境使用稀疏奖励，目标通常是1.0
+    rtg_target = 1000
 else:
-    raise ValueError("We only care about Mujoco envs for now.")
+    raise ValueError("Environment not supported.")
 config.rtg_target = rtg_target
 
 
@@ -80,10 +101,15 @@ class MaskedCausalAttention(nn.Module):
 
     @nn.compact
     def __call__(
-        self, x: jnp.ndarray, training=True
+        self, x: jnp.ndarray, cross: jnp.ndarray = None, training=True
     ) -> Tuple[jnp.ndarray, jnp.ndarray]:
         B, T, C = x.shape
+        input_tensor = x if cross is None else cross
+
         N, D = self.n_heads, C // self.n_heads
+        assert (
+            cross is None or cross.shape == x.shape
+        ), f"Our cross shape {cross.shape if cross is not None else None} must match x shape {x.shape}"
         # rearrange q, k, v as (B, N, T, D)
         q = (
             nn.Dense(self.h_dim, kernel_init=self.kernel_init)(x)
@@ -91,12 +117,12 @@ class MaskedCausalAttention(nn.Module):
             .transpose(0, 2, 1, 3)
         )
         k = (
-            nn.Dense(self.h_dim, kernel_init=self.kernel_init)(x)
+            nn.Dense(self.h_dim, kernel_init=self.kernel_init)(input_tensor)
             .reshape(B, T, N, D)
             .transpose(0, 2, 1, 3)
         )
         v = (
-            nn.Dense(self.h_dim, kernel_init=self.kernel_init)(x)
+            nn.Dense(self.h_dim, kernel_init=self.kernel_init)(input_tensor)
             .reshape(B, T, N, D)
             .transpose(0, 2, 1, 3)
         )
@@ -178,6 +204,18 @@ class DecisionTransformer(nn.Module):
         self.predict_state = nn.Dense(self.state_dim, kernel_init=self.kernel_init)
         self.predict_action = nn.Dense(self.act_dim, kernel_init=self.kernel_init)
 
+        # alignment projector
+        self.alignment_projector = nn.Dense(self.h_dim, kernel_init=self.kernel_init)
+        # self.action_projector = nn.Dense(self.h_dim, kernel_init=self.kernel_init)
+
+        # alignment attention
+        self.alignment_attention = MaskedCausalAttention(
+            h_dim=self.h_dim,
+            max_T=self.context_len,
+            n_heads=self.n_heads,
+            drop_p=self.drop_p,
+        )
+
     def __call__(
         self,
         timesteps: jnp.ndarray,
@@ -218,7 +256,39 @@ class DecisionTransformer(nn.Module):
         if self.use_action_tanh:
             action_preds = jnp.tanh(action_preds)
 
-        return state_preds, action_preds, return_preds, attns
+        # return state_preds, action_preds, return_preds, attns
+
+        # 在返回前，提取重塑后的状态和动作表示
+        # reshape后h的形状是 (B, 3, T, h_dim)
+        return_repr = h[:, 0]  # 提取回报表示
+        state_repr = h[:, 1]  # 提取状态表示
+        action_repr = h[:, 2]  # 提取动作表示
+
+        use_r_condition_attn = True
+        if use_r_condition_attn:
+            # 用state_repr,action_repr作为Q值，return_repr作为KV值，计算增强后的state_repr
+            state_repr_conditioned, sr_weight = self.alignment_attention(
+                x=state_repr, cross=return_repr, training=training
+            )
+            action_repr_conditioned, ar_weight = self.alignment_attention(
+                x=action_repr, cross=return_repr, training=training
+            )
+            state_proj = self.alignment_projector(state_repr_conditioned)
+            action_proj = self.alignment_projector(action_repr_conditioned)
+
+        else:
+            state_proj = self.alignment_projector(state_repr)
+            action_proj = self.alignment_projector(action_repr)
+
+        # 归一化表示（提高稳定性）
+        state_proj = state_proj / (
+            jnp.linalg.norm(state_proj, axis=-1, keepdims=True) + 1e-8
+        )
+        action_proj = action_proj / (
+            jnp.linalg.norm(action_proj, axis=-1, keepdims=True) + 1e-8
+        )
+
+        return state_preds, action_preds, return_preds, attns, (state_proj, action_proj)
 
 
 def discount_cumsum(x: jnp.ndarray, gamma: float) -> jnp.ndarray:
@@ -252,17 +322,27 @@ def get_traj_minari(dataset_name):
 
     # Process each trajectory
     for traj in episodes_generator:
+        obs = (
+            jnp.concat(
+                [
+                    traj.observations["achieved_goal"],
+                    traj.observations["desired_goal"],
+                    traj.observations["observation"],
+                ],
+                axis=-1,
+            )
+            if "antmaze" in dataset_name
+            else traj.observations
+        )
         episode_data = {
-            "observations": traj.observations[:-1],  # Exclude the last observation
-            "next_observations": traj.observations[
-                1:
-            ],  # Start from the second observation
+            "observations": obs[:-1],  # Exclude the last observation
+            "next_observations": obs[1:],  # Start from the second observation
             "actions": traj.actions,
             "rewards": traj.rewards,
             "terminals": traj.terminations,
         }
         paths.append(episode_data)
-        all_observations.append(traj.observations)
+        all_observations.append(obs)
 
     # Calculate statistics
     all_observations = np.vstack(all_observations)
@@ -406,28 +486,70 @@ class DT(object):
         )
 
         def loss_fn(params):
-            state_preds, action_preds, return_preds, attns = (
-                train_state.transformer.apply_fn(
-                    params,
-                    timesteps,
-                    states,
-                    actions,
-                    returns_to_go,
-                    rngs={"dropout": rng},
-                )
+            (
+                state_preds,
+                action_preds,
+                return_preds,
+                attns,
+                (state_proj, action_proj),
+            ) = train_state.transformer.apply_fn(
+                params,
+                timesteps,
+                states,
+                actions,
+                returns_to_go,
+                rngs={"dropout": rng},
             )  # B x T x state_dim, B x T x act_dim, B x T x 1
             # mask actions
             actions_masked = actions * traj_mask[:, :, None]
             action_preds_masked = action_preds * traj_mask[:, :, None]
             # Calculate mean squared error loss
             action_loss = jnp.mean(jnp.square(action_preds_masked - actions_masked))
-            return action_loss
+            # return action_loss
 
-        grad_fn = jax.value_and_grad(loss_fn)
-        loss, grad = grad_fn(train_state.transformer.params)
+            # 计算对齐损失 (InfoNCE对比损失)
+            # 计算相似度矩阵
+            similarity = jnp.einsum("btd,bsd->bts", state_proj, action_proj)
+            similarity = similarity / config.alignment_temp
+
+            # 创建掩码，只考虑有效轨迹部分
+            valid_mask = traj_mask[:, :, None] * traj_mask[:, None, :]
+
+            # 正样本是同一时间步的状态和动作
+            diag_mask = jnp.eye(state_proj.shape[1])[None, :, :] * valid_mask
+
+            # 防止数值不稳定
+            max_sim = jnp.max(similarity, axis=-1, keepdims=True)
+            exp_sim = jnp.exp(similarity - max_sim)
+
+            # 计算正样本相似度
+            pos_sim = jnp.sum(exp_sim * diag_mask, axis=-1) + 1e-8
+            # 计算所有可能的相似度
+            all_sim = jnp.sum(exp_sim * valid_mask, axis=-1) + 1e-8
+
+            # 对比损失: -log(pos_sim / all_sim)
+            alignment_loss = -jnp.log(pos_sim / all_sim)
+            alignment_loss = jnp.mean(alignment_loss * traj_mask)  # 只考虑有效部分
+
+            # 总损失
+            total_loss = action_loss + config.alignment_weight * alignment_loss
+
+            return total_loss, (action_loss, alignment_loss)
+
+        grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
+        # loss, grad = grad_fn(train_state.transformer.params)
+        (total_loss, (action_loss, alignment_loss)), grad = grad_fn(
+            train_state.transformer.params
+        )
+
         # Apply gradient clipping
         transformer = train_state.transformer.apply_gradients(grads=grad)
-        return train_state._replace(transformer=transformer), loss
+        # return train_state._replace(transformer=transformer), loss
+        return train_state._replace(transformer=transformer), {
+            "loss": total_loss,
+            "action_loss": action_loss,
+            "alignment_loss": alignment_loss,
+        }
 
     @classmethod
     def get_action(
@@ -438,15 +560,19 @@ class DT(object):
         actions: jnp.ndarray,
         returns_to_go: jnp.ndarray,
     ) -> Tuple[jnp.ndarray, Dict[int, jnp.ndarray]]:
-        state_preds, action_preds, return_preds, attns = (
-            train_state.transformer.apply_fn(
-                train_state.transformer.params,
-                timesteps,
-                states,
-                actions,
-                returns_to_go,
-                training=False,
-            )
+        (
+            state_preds,
+            action_preds,
+            return_preds,
+            attns,
+            (state_proj, action_proj),
+        ) = train_state.transformer.apply_fn(
+            train_state.transformer.params,
+            timesteps,
+            states,
+            actions,
+            returns_to_go,
+            training=False,
         )
         return action_preds, attns
 
@@ -503,7 +629,10 @@ def evaluate(
     results = {}
     total_reward = 0
     total_timesteps = 0
-    state_dim = env.observation_space.shape[0]
+    if "mujoco" in config.dataset_name:
+        state_dim = env.observation_space.shape[0]
+    elif "antmaze" in config.dataset_name:
+        state_dim = sum([part.shape[0] for part in env.observation_space.values()])
     act_dim = env.action_space.shape[0]
     # same as timesteps used for training the transformer
     timesteps = jnp.arange(0, config.max_eval_ep_len, 1, jnp.int32)
@@ -527,6 +656,15 @@ def evaluate(
         for t in tqdm(range(config.max_eval_ep_len)):
             total_timesteps += 1
             # add state in placeholder and normalize
+            if "antmaze" in config.dataset_name:
+                running_state = jnp.concat(
+                    [
+                        running_state["achieved_goal"],
+                        running_state["desired_goal"],
+                        running_state["observation"],
+                    ],
+                    axis=-1,
+                )
             states = states.at[0, t].set((running_state - state_mean) / state_std)
             # calcualate running rtg and add in placeholder
             running_rtg = running_rtg - (running_reward / config.rtg_scale)
@@ -571,8 +709,15 @@ def normalize_score(score, env_id="HalfCheetah-v5"):
         "Ant-v5": {"min": 0.0, "max": 6000.0},
         "HalfCheetah-v5": {"min": -280.0, "max": 12000.0},
         "Hopper-v5": {"min": -20.0, "max": 3800.0},
-        "Humanoid-v5": {"min": 0.0, "max": 10000.0},
+        "Humanoid-v5": {"min": 0.0, "max": 12000.0},
         "Walker2d-v5": {"min": 0.0, "max": 5000.0},
+        "InvertedDoublePendulum-v5": {"min": 0.0, "max": 9100.0},
+        "Pusher-v5": {"min": -100.0, "max": 0.0},  # Pusher通常是负回报环境
+        "Reacher-v5": {"min": -40.0, "max": -1.0},  # Reacher也是负回报环境
+        "Swimmer-v5": {"min": 0.0, "max": 360.0},
+        "AntMaze_UMaze-v5": {"min": 0.0, "max": 1000.0},
+        "AntMaze_Medium-v5": {"min": 0.0, "max": 1000.0},
+        "AntMaze_Large-v5": {"min": 0.0, "max": 1000.0},
         # 添加其他MuJoCo环境
     }
 
@@ -586,10 +731,20 @@ def normalize_score(score, env_id="HalfCheetah-v5"):
 
 
 if __name__ == "__main__":
-    wandb.init(project=config.project, config=config)
+    wandb.init(
+        project=config.project,
+        name=f"{config.experiment_name}-{config.dataset_name}-seed-{config.seed}",
+        config=config,
+    )
+    dataset = minari.load_dataset(config.dataset_name)
+    # env = dataset.recover_environment()
     env = gym.make(config.env_name)
     rng = jax.random.PRNGKey(config.seed)
-    state_dim = env.observation_space.shape[0]
+    if "mujoco" in config.dataset_name:
+        state_dim = env.observation_space.shape[0]
+    elif "antmaze" in config.dataset_name:
+        # state_dim = env.observation_space["observation"].shape[0]
+        state_dim = sum([part.shape[0] for part in env.observation_space.values()])
     act_dim = env.action_space.shape[0]
     trajectories, episode_num, traj_lengths, state_mean, state_std = (
         make_padded_trajectories(config)
@@ -622,7 +777,10 @@ if __name__ == "__main__":
             episode_num,
             traj_lengths,
         )  # B x T x D
-        train_state, action_loss = update_fn(train_state, traj_batch, update_rng)  # update parameters
+        # train_state, action_loss = update_fn(train_state, traj_batch, update_rng)  # update parameters
+        train_state, losses = update_fn(
+            train_state, traj_batch, update_rng
+        )  # update parameters
 
         if i % config.eval_interval == 0:
             # evaluate on env
@@ -632,7 +790,10 @@ if __name__ == "__main__":
             print(i, normalized_score)
             wandb.log(
                 {
-                    "action_loss": action_loss,
+                    # "action_loss": action_loss,
+                    "action_loss": losses["action_loss"],
+                    "alignment_loss": losses["alignment_loss"],
+                    "total_loss": losses["loss"],
                     f"{config.env_name}/normalized_score": normalized_score,
                     "step": i,
                 }
@@ -650,7 +811,18 @@ if __name__ == "__main__":
     normalized_score = evaluate(
         algo.get_action, train_state, env, config, state_mean, state_std
     )
+    wandb.log(
+        {
+            # "action_loss": action_loss,
+            "action_loss": losses["action_loss"],
+            "alignment_loss": losses["alignment_loss"],
+            "total_loss": losses["loss"],
+            f"{config.env_name}/normalized_score": normalized_score,
+            "step": i + 1,
+        }
+    )
     wandb.log({f"{config.env_name}/final_normalized_score": normalized_score})
+    wandb.log({f"{config.env_name}/best_score": best_score})
 
     # Save final model
     final_ckpt_path = os.path.join(ckpt_dir, "final_model")
